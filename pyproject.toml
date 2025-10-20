@@ -1,0 +1,35 @@
+[build-system]
+requires = [
+    "setuptools >= 40.6.0",
+    "wheel"
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "classic-pg-listener"
+version = "1.2.0"
+authors = [
+    {name = "Sergei Variasov", email = "variasov@gmail.com"},
+]
+description = "Simple in-process scheduler"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "classic-actors~=0.1",
+    "psycopg~=3.2.1",
+    "classic-thread-pool-executor~=1.1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/variasov/classic-pg-listener"
+
+[project.optional-dependencies]
+dev = [
+    "build~=1.2.2.post1",
+    "pytest==8.3.4",
+    "pytest-cov==6.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["sources"]
