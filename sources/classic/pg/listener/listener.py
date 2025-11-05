@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 import logging
 from typing import Callable, TypeAlias, Optional
 
+import psycopg
 from psycopg import Connection, Notify
 
 from classic.actors import Actor, Stop
@@ -134,12 +135,15 @@ class Listener(Actor):
         else:
             self._executor = None
 
-    def _before_run(self) -> None:
-        self._connect()
+        self._notifies = None
 
     def _loop(self) -> None:
         try:
+            if self._connection is None:
+                self._connect()
             notify = next(self._notifies)
+        except psycopg.OperationalError:
+            self._disconnect()
         except StopIteration:
             self._renew_notifies()
         except KeyboardInterrupt:
@@ -156,8 +160,8 @@ class Listener(Actor):
             elif isinstance(message, RemoveCallback):
                 self._remove_callback(message)
 
-    def _after_run(self):
-        self._connection.close()
+    def _after_loop(self):
+        self._disconnect()
         if self._executor:
             self._executor.shutdown(wait=False, cancel_futures=True)
 
@@ -166,6 +170,12 @@ class Listener(Actor):
         self._connection.autocommit = True
         self._subscribe_all()
         self._renew_notifies()
+
+    def _disconnect(self) -> None:
+        try:
+            self._connection.close()
+        except Exception:
+            pass
 
     def _renew_notifies(self):
         self._notifies = self._connection.notifies(timeout=self.timeout)
