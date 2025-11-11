@@ -1,6 +1,7 @@
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 import logging
+import time
 from typing import Callable, TypeAlias, Optional
 
 import psycopg
@@ -118,12 +119,14 @@ class Listener(Actor):
     _callbacks: dict[str, Receiver]
     _executor: Optional[ThreadPoolExecutor]
     _logger: logging.Logger
+    _notifies_renews_count: int | None
 
     def __init__(
             self,
             connection_factory: ConnectionFactory,
             max_workers: int = 1,
             logger: Optional[logging.Logger] = None,
+            ping_period: float = 60.0,
     ) -> None:
         super().__init__()
         self._connection_factory = connection_factory
@@ -136,20 +139,24 @@ class Listener(Actor):
             self._executor = None
 
         self._notifies = None
+        self._notifies_renews_count = 0
+        self._ping_period = ping_period
 
     def _loop(self) -> None:
-        try:
-            if self._connection is None:
-                self._connect()
-            notify = next(self._notifies)
-        except psycopg.OperationalError:
-            self._disconnect()
-        except StopIteration:
-            self._renew_notifies()
-        except KeyboardInterrupt:
-            self._stop()
-        else:
-            self._on_notify(notify)
+        self._try_to_connect()
+
+        if self._connection:
+            try:
+                notify = next(self._notifies)
+            except psycopg.OperationalError:
+                self._ping_if_needed()
+                self._disconnect()
+            except StopIteration:
+                self._renew_notifies()
+            except KeyboardInterrupt:
+                self._stop()
+            else:
+                self._on_notify(notify)
 
         while not self._inbox.empty():
             message = self._inbox.get(block=False)
@@ -165,11 +172,15 @@ class Listener(Actor):
         if self._executor:
             self._executor.shutdown(wait=False, cancel_futures=True)
 
-    def _connect(self) -> None:
-        self._connection: Connection = self._connection_factory()
-        self._connection.autocommit = True
-        self._subscribe_all()
-        self._renew_notifies()
+    def _try_to_connect(self) -> None:
+        try:
+            self._connection: Connection = self._connection_factory()
+            self._connection.autocommit = True
+            self._subscribe_all()
+            self._notifies_renews_count = 0
+            self._renew_notifies()
+        except psycopg.OperationalError:
+            self._disconnect()
 
     def _disconnect(self) -> None:
         try:
@@ -177,7 +188,21 @@ class Listener(Actor):
         except Exception:
             pass
 
+    def _ping_if_needed(self) -> None:
+        if self._ping_period == 0 or self._notifies_renews_count == 0:
+            return
+
+        # Time since last ping > ping period
+        if self._notifies_renews_count * self._timeout > self._ping_period:
+            self._notifies_renews_count = 0
+            try:
+                self._connection.execute('SELECT 1')
+            except psycopg.OperationalError:
+                self._disconnect()
+                return
+
     def _renew_notifies(self):
+        self._notifies_renews_count += 1
         self._notifies = self._connection.notifies(timeout=self.timeout)
 
     def _subscribe_all(self) -> None:
@@ -194,6 +219,8 @@ class Listener(Actor):
             self._executor.submit(callback, notify)
         else:
             callback(notify)
+
+        self._last_activity_time = time.time()
 
     def add_callback(self, callback: Receiver, channel: str) -> Future:
         """
