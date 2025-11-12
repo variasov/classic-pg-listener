@@ -139,7 +139,7 @@ class Listener(Actor):
             self._executor = None
 
         self._notifies = None
-        self._notifies_renews_count = 0
+        self._time_since_last_activity = None
         self._ping_period = ping_period
 
     def _loop(self) -> None:
@@ -149,9 +149,9 @@ class Listener(Actor):
             try:
                 notify = next(self._notifies)
             except psycopg.OperationalError:
-                self._ping_if_needed()
                 self._disconnect()
-            except StopIteration:
+            except StopIteration:  # Timeout, notify not received
+                self._ping_if_needed()
                 self._renew_notifies()
             except KeyboardInterrupt:
                 self._stop()
@@ -173,36 +173,49 @@ class Listener(Actor):
             self._executor.shutdown(wait=False, cancel_futures=True)
 
     def _try_to_connect(self) -> None:
+        if self._connection:
+            return
+
         try:
             self._connection: Connection = self._connection_factory()
             self._connection.autocommit = True
             self._subscribe_all()
             self._notifies_renews_count = 0
             self._renew_notifies()
+            self._logger.info('Connected with server')
         except psycopg.OperationalError:
             self._disconnect()
 
     def _disconnect(self) -> None:
         try:
             self._connection.close()
+            self._logger.info('Connection closed.')
         except Exception:
-            pass
+            self._logger.debug('Can\'t disconnect, connection is None')
+        finally:
+            self._connection = None
+
 
     def _ping_if_needed(self) -> None:
-        if self._ping_period == 0 or self._notifies_renews_count == 0:
+        if not self._ping_period:
+            return
+
+        if not self._time_since_last_activity:
+            self._time_since_last_activity = time.time()
             return
 
         # Time since last ping > ping period
-        if self._notifies_renews_count * self._timeout > self._ping_period:
-            self._notifies_renews_count = 0
+        if time.time() - self._time_since_last_activity >= self._ping_period:
+            self._time_since_last_activity = time.time()
             try:
                 self._connection.execute('SELECT 1')
+                self._logger.debug('Ping succeeded')
             except psycopg.OperationalError:
+                self._logger.error('Ping failed')
                 self._disconnect()
                 return
 
     def _renew_notifies(self):
-        self._notifies_renews_count += 1
         self._notifies = self._connection.notifies(timeout=self.timeout)
 
     def _subscribe_all(self) -> None:
@@ -211,16 +224,20 @@ class Listener(Actor):
 
     def _subscribe(self, channel: str) -> None:
         self._connection.execute(f'LISTEN {channel}')
-        logging.info('Started listening on %s', channel)
+        self._logger.info('Started listening on %s', channel)
 
     def _on_notify(self, notify: Notify) -> None:
+        self._logger.debug(
+            'Notify received from %s and pid %s',
+            notify.channel,
+            notify.pid,
+        )
+        self._time_since_last_activity = time.time()
         callback = self._callbacks[notify.channel]
         if self._executor:
             self._executor.submit(callback, notify)
         else:
             callback(notify)
-
-        self._last_activity_time = time.time()
 
     def add_callback(self, callback: Receiver, channel: str) -> Future:
         """

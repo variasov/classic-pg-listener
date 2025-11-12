@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "classic-pg-listener"
-version = "1.2.2"
+version = "1.2.6"
 authors = [
     {name = "Sergei Variasov", email = "variasov@gmail.com"},
 ]
