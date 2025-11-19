@@ -2,7 +2,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 import logging
 import time
-from typing import Callable, TypeAlias, Optional
+import queue
+from typing import Callable, TypeAlias, Optional, Any
 
 import psycopg
 from psycopg import Connection, Notify
@@ -120,6 +121,8 @@ class Listener(Actor):
     _executor: Optional[ThreadPoolExecutor]
     _logger: logging.Logger
     _notifies_renews_count: int | None
+    _last_conn_time: float | None
+    _conn_retry_interval: float
 
     def __init__(
             self,
@@ -127,11 +130,16 @@ class Listener(Actor):
             max_workers: int = 1,
             logger: Optional[logging.Logger] = None,
             ping_period: float = 60.0,
+            conn_retry_interval: float = 1.0,
     ) -> None:
         super().__init__()
         self._connection_factory = connection_factory
-        self._logger = logger or logging.getLogger('classic.pg.listener')
         self._connection = None
+        self._last_conn_time = None
+        self._conn_retry_interval = conn_retry_interval
+
+        self._logger = logger or logging.getLogger('classic.pg.listener')
+
         self._callbacks = {}
         if max_workers:
             self._executor = ThreadPoolExecutor(max_workers=max_workers)
@@ -158,19 +166,32 @@ class Listener(Actor):
             else:
                 self._on_notify(notify)
 
-        while not self._inbox.empty():
-            message = self._inbox.get(block=False)
-            if isinstance(message, Stop):
-                self._stop()
-            elif isinstance(message, AddCallback):
-                self._add_callback(message)
-            elif isinstance(message, RemoveCallback):
-                self._remove_callback(message)
+        if self._connection is not None:
+            while not self._inbox.empty():
+                message = self._inbox.get(block=False)
+                self._on_message(message)
+        else:
+            try:
+                message = self._inbox.get(
+                    block=True,
+                    timeout=self._conn_retry_interval,
+                )
+            except queue.Empty:
+                message = None
+            self._on_message(message)
 
     def _after_loop(self):
         self._disconnect()
         if self._executor:
             self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def _on_message(self, message: Any) -> None:
+        if isinstance(message, Stop):
+            self._stop()
+        elif isinstance(message, AddCallback):
+            self._add_callback(message)
+        elif isinstance(message, RemoveCallback):
+            self._remove_callback(message)
 
     def _try_to_connect(self) -> None:
         if self._connection:
@@ -187,25 +208,23 @@ class Listener(Actor):
             self._disconnect()
 
     def _disconnect(self) -> None:
-        try:
-            self._connection.close()
-            self._logger.info('Connection closed.')
-        except Exception:
-            self._logger.debug('Can\'t disconnect, connection is None')
-        finally:
-            self._connection = None
-
+        if self._connection:
+            try:
+                self._connection.close()
+                self._logger.info('Connection closed.')
+            except Exception:
+                pass
+            finally:
+                self._connection = None
 
     def _ping_if_needed(self) -> None:
         if not self._ping_period:
             return
 
-        if not self._time_since_last_activity:
+        if self._time_since_last_activity is None:
             self._time_since_last_activity = time.time()
-            return
-
         # Time since last ping > ping period
-        if time.time() - self._time_since_last_activity >= self._ping_period:
+        elif time.time() - self._time_since_last_activity >= self._ping_period:
             self._time_since_last_activity = time.time()
             try:
                 self._connection.execute('SELECT 1')
@@ -213,7 +232,6 @@ class Listener(Actor):
             except psycopg.OperationalError:
                 self._logger.error('Ping failed')
                 self._disconnect()
-                return
 
     def _renew_notifies(self):
         self._notifies = self._connection.notifies(timeout=self.timeout)
