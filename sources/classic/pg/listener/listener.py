@@ -1,3 +1,4 @@
+import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 import logging
@@ -245,17 +246,35 @@ class Listener(Actor):
         self._logger.info('Started listening on %s', channel)
 
     def _on_notify(self, notify: Notify) -> None:
+        callback = self._callbacks[notify.channel]
+        notify_id = str(uuid.uuid4())
         self._logger.debug(
-            'Notify received from %s and pid %s',
+            'Notify received from [%s] and pid [%s], '
+            'client notify id is [%s]',
             notify.channel,
             notify.pid,
+            notify_id
         )
         self._time_since_last_activity = time.time()
-        callback = self._callbacks[notify.channel]
+
+        def wrapper():
+            self._logger.debug('Try to handle notify [%s]', notify_id)
+
+            try:
+                callback(notify)
+            except Exception:
+                self._logger.exception(
+                    'Exception occurred while handling notify id [%s]',
+                    notify_id,
+                    exc_info=True,
+                )
+            else:
+                self._logger.debug('Notify handled [%s]', notify_id)
+
         if self._executor:
-            self._executor.submit(callback, notify)
+            self._executor.submit(wrapper)
         else:
-            callback(notify)
+            wrapper()
 
     def add_callback(self, callback: Receiver, channel: str) -> Future:
         """
